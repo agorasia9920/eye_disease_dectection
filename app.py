@@ -11,7 +11,6 @@ from datetime import datetime
 import smtplib
 from email.message import EmailMessage
 import ssl
-import os
 
 @st.cache_resource
 def load_eye_model():
@@ -63,8 +62,9 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None
     return heatmap.numpy()
 
 def send_email(to_email, subject, body, attachment=None):
-    SENDER_EMAIL = "aditya.gorasia2022@vitstudent.ac.in"
-    SENDER_PASSWORD = "hyixdazjpzfyabsg"
+    # Use Streamlit secrets (set in Cloud UI, not in code!)
+    SENDER_EMAIL = st.secrets["email"]["user"]
+    SENDER_PASSWORD = st.secrets["email"]["password"]
     msg = EmailMessage()
     msg['Subject'] = subject
     msg['From'] = SENDER_EMAIL
@@ -81,58 +81,63 @@ def send_email(to_email, subject, body, attachment=None):
         server.send_message(msg)
 
 st.title("👁️ Eye Disease Detection (Retina Image)")
-st.write("Select an image from the dropdown below to analyze. You can edit the advice and send reports with attachments.")
+st.write("Upload or scan retinal image, review and edit advice before sending, attach files, and share an instant report!")
 
-# List all uploaded images from current directory (adjust path as needed)
-image_files = [f for f in os.listdir() if f.endswith('.jpg') or f.endswith('.png') or f.endswith('.jpeg')]
-image_labels = [f"Image {i+1}: {os.path.basename(f)}" for i, f in enumerate(image_files)]
+input_mode = st.radio("Choose image input method:", ["Upload from file", "Scan with camera"])
+img = None
 
-selected_idx = st.selectbox("Choose image for analysis:", list(range(len(image_files))), format_func=lambda x: image_labels[x])
+if input_mode == "Upload from file":
+    uploaded_file = st.file_uploader("Upload image...", type=["jpg", "png", "jpeg"])
+    if uploaded_file is not None:
+        img = Image.open(uploaded_file)
+        st.image(img, caption="Uploaded Image", use_container_width=True)
+elif input_mode == "Scan with camera":
+    img_file_buffer = st.camera_input("Take a retinal (fundus) picture")
+    if img_file_buffer is not None:
+        img = Image.open(img_file_buffer)
+        st.image(img, caption="Captured Image", use_container_width=True)
 
-selected_image_path = image_files[selected_idx]
-img = Image.open(selected_image_path)
-st.image(img, caption=image_labels[selected_idx], use_container_width=True)
+if img is not None:
+    if st.button("🔍 Predict"):
+        if not is_eye_image(img):
+            st.warning("⚠️ This image does not appear to be a valid retinal (fundus) image.")
+        else:
+            img_resized = image.img_to_array(img.resize((128, 128)))
+            x = np.expand_dims(img_resized, axis=0)
+            prediction = model.predict(x)
+            pred_class = np.argmax(prediction)
+            confidence = np.max(prediction)
+            predicted_disease = class_labels[pred_class]
+            predicted_severity = "None" if predicted_disease == "Normal" else None
 
-if st.button("🔍 Predict"):
-    if not is_eye_image(img):
-        st.warning("⚠️ This image does not appear to be a valid retinal (fundus) image.")
-    else:
-        img_resized = image.img_to_array(img.resize((128, 128)))
-        x = np.expand_dims(img_resized, axis=0)
-        prediction = model.predict(x)
-        pred_class = np.argmax(prediction)
-        confidence = np.max(prediction)
-        predicted_disease = class_labels[pred_class]
-        predicted_severity = "None" if predicted_disease == "Normal" else None
+            st.success(f"**{predicted_disease}** ({confidence*100:.2f}%)")
 
-        st.success(f"**{predicted_disease}** ({confidence*100:.2f}%)")
+            key = (predicted_disease, predicted_severity)
+            rec = recommendations.get(key, {"advice": "", "tips": ""})
 
-        key = (predicted_disease, predicted_severity)
-        rec = recommendations.get(key, {"advice": "", "tips": ""})
+            st.markdown("### 🩺 Personalized Clinical Recommendations")
+            st.info(f"**Advice** (editable below): {rec['advice']}")
+            st.write(f"**Lifestyle Tips** (editable below): {rec['tips']}")
 
-        st.markdown("### 🩺 Personalized Clinical Recommendations")
-        st.info(f"**Advice** (editable below): {rec['advice']}")
-        st.write(f"**Lifestyle Tips** (editable below): {rec['tips']}")
+            with st.expander("Show Model Explanation (Grad-CAM Heatmap)"):
+                heatmap = make_gradcam_heatmap(x, model, last_conv_layer_name='conv2d_3', pred_index=pred_class)
+                heatmap_resized = Image.fromarray(np.uint8(255 * heatmap)).resize(img.size)
+                heatmap_array = np.array(heatmap_resized)
+                img_array = np.array(img.convert("RGB")).astype(np.float32)
+                heatmap_color = cm.jet(heatmap_array / 255.0)[:, :, :3]
+                superimposed_img = np.uint8(0.6 * img_array + 0.4 * 255 * heatmap_color)
+                st.image(superimposed_img, caption="Grad-CAM Heatmap", use_container_width=True)
 
-        with st.expander("Show Model Explanation (Grad-CAM Heatmap)"):
-            heatmap = make_gradcam_heatmap(x, model, last_conv_layer_name='conv2d_3', pred_index=pred_class)
-            heatmap_resized = Image.fromarray(np.uint8(255 * heatmap)).resize(img.size)
-            heatmap_array = np.array(heatmap_resized)
-            img_array = np.array(img.convert("RGB")).astype(np.float32)
-            heatmap_color = cm.jet(heatmap_array / 255.0)[:, :, :3]
-            superimposed_img = np.uint8(0.6 * img_array + 0.4 * 255 * heatmap_color)
-            st.image(superimposed_img, caption="Grad-CAM Heatmap", use_container_width=True)
+            with st.form("doctor_form"):
+                advice = st.text_area("Advice to patient", value=rec['advice'])
+                tips = st.text_area("Lifestyle tips", value=rec['tips'])
+                prescription = st.text_area("Prescription (editable)")
+                patient_email = st.text_input("Patient Email Address")
+                uploaded_presc = st.file_uploader("Attach prescription/media (image/pdf)", type=["jpg", "jpeg", "png", "pdf"])
+                submit_button = st.form_submit_button("Send Report to Patient")
 
-        with st.form("doctor_form"):
-            advice = st.text_area("Advice to patient", value=rec['advice'])
-            tips = st.text_area("Lifestyle tips", value=rec['tips'])
-            prescription = st.text_area("Prescription (editable)")
-            patient_email = st.text_input("Patient Email Address")
-            uploaded_presc = st.file_uploader("Attach prescription/media (image/pdf)", type=["jpg", "jpeg", "png", "pdf"])
-            submit_button = st.form_submit_button("Send Report to Patient")
-
-        if submit_button and patient_email:
-            email_body = f"""
+            if submit_button and patient_email:
+                email_body = f"""
 Eye Disease Report ({datetime.now().strftime('%Y-%m-%d %I:%M %p')})
 
 Diagnosis: {predicted_disease} ({confidence*100:.2f}%)
@@ -144,23 +149,23 @@ Lifestyle Tips: {tips}
 Prescription:
 {prescription}
 """
-            attachment_info = None
-            if uploaded_presc is not None:
-                attachment_info = {
-                    "filename": uploaded_presc.name,
-                    "data": uploaded_presc.getvalue(),
-                    "mime_type": uploaded_presc.type or "application/octet-stream"
-                }
-            try:
-                send_email(
-                    to_email=patient_email,
-                    subject="Your Eye Disease Report",
-                    body=email_body,
-                    attachment=attachment_info
-                )
-                st.success(f"✅ Report sent to {patient_email}")
-            except Exception as e:
-                st.error(f"Email sending failed: {e}")
+                attachment_info = None
+                if uploaded_presc is not None:
+                    attachment_info = {
+                        "filename": uploaded_presc.name,
+                        "data": uploaded_presc.getvalue(),
+                        "mime_type": uploaded_presc.type or "application/octet-stream"
+                    }
+                try:
+                    send_email(
+                        to_email=patient_email,
+                        subject="Your Eye Disease Report",
+                        body=email_body,
+                        attachment=attachment_info
+                    )
+                    st.success(f"✅ Report sent to {patient_email}")
+                except Exception as e:
+                    st.error(f"Email sending failed: {e}")
 
 st.markdown("---")
-st.caption("Demo only. Images must be present in the app directory. Uses Google SMTP—check spam/junk folders.")
+st.caption("Demo only. Attachments must be small. Emails use Google SMTP; use app password and check spam/junk folders if not received.")
